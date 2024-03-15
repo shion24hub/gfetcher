@@ -1,11 +1,29 @@
 package main
 
 import (
+	"compress/gzip"
+	"context"
+	"encoding/csv"
 	"fmt"
+	"io"
+	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"time"
+
+	"github.com/go-gota/gota/dataframe"
 )
+
+const baseURL = "https://public.bybit.com/trading/"
+
+type BybitTradingRow struct {
+	Timestamp time.Time
+	Symbol    string
+	Side      string
+	Size      string
+	Price     string
+}
 
 func rangeDate(start, end time.Time) []time.Time {
 	var dates []time.Time
@@ -22,6 +40,89 @@ func parseDate(date string) (time.Time, error) {
 		return time.Time{}, err
 	}
 	return dt, nil
+}
+
+func makeURLs(symbol string, start, end time.Time) []string {
+	var urls []string
+
+	for _, dt := range rangeDate(start, end) {
+		fileName := symbol + dt.Format("2006-01-02") + ".csv.gz"
+		url, err := url.JoinPath(baseURL, symbol, fileName)
+		if err != nil {
+			fmt.Println("Invalid symbol name")
+			os.Exit(1)
+		}
+
+		urls = append(urls, url)
+	}
+	return urls
+}
+
+func downloadTradingData(url string) []BybitTradingRow {
+
+	client := http.Client{
+		Timeout: 30 * time.Second,
+	}
+
+	req, err := http.NewRequestWithContext(
+		context.Background(),
+		http.MethodGet,
+		url,
+		nil,
+	)
+	if err != nil {
+		fmt.Println("Error: ", err)
+		os.Exit(1)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		fmt.Println("Error: ", err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+
+	gz, err := gzip.NewReader(resp.Body)
+	if err != nil {
+		fmt.Println("Error: ", err)
+		os.Exit(1)
+	}
+
+	r := csv.NewReader(gz)
+
+	btrs := []BybitTradingRow{}
+	// skip header
+	r.Read()
+	for {
+		record, err := r.Read()
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			fmt.Println("Error: ", err)
+			os.Exit(1)
+		}
+
+		// convert string of Unix timestamp(ms) to time.Time
+		t, err := strconv.ParseFloat(record[0], 64)
+		if err != nil {
+			fmt.Println("Error: ", err)
+			os.Exit(1)
+		}
+		tm := time.UnixMilli(int64(t * 1000))
+
+		btd := BybitTradingRow{
+			Timestamp: tm,
+			Symbol:    record[1],
+			Side:      record[2],
+			Size:      record[3],
+			Price:     record[4],
+		}
+
+		btrs = append(btrs, btd)
+	}
+
+	return btrs
 }
 
 func main() {
@@ -43,18 +144,14 @@ func main() {
 		os.Exit(1)
 	}
 
-	// make url
-	for _, dt := range rangeDate(st, ed) {
+	urls := makeURLs(os.Args[1], st, ed)
+	for _, url := range urls {
 
-		endpoint := "https://public.bybit.com/trading/"
-		fileName := os.Args[1] + dt.Format("2006-01-02") + ".csv.gz"
+		fmt.Println("Downloading: ", url)
 
-		endpoint, err = url.JoinPath(endpoint, os.Args[1], fileName)
-		if err != nil {
-			fmt.Println("Invalid symbol name")
-			os.Exit(1)
-		}
+		trd := downloadTradingData(url)
+		df := dataframe.LoadStructs(trd)
 
-		fmt.Println(endpoint)
+		fmt.Println(df)
 	}
 }
